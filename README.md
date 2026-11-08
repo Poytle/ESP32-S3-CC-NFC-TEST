@@ -13,7 +13,7 @@ A self-contained feasibility demo: an ESP32-S3 reads ISO14443A cards using a PN5
 
 Set the PN532 module switches/jumpers to **I2C** (7-bit address `0x24`). Use 3.3 V logic and pull-ups to 3.3 V; check your module's power specification. IRQ/reset are not required: the driver polls the PN532 I2C status byte. Wiring is configured in `setup()` in `src/main.cpp`.
 
-**Check your ESP32-S3 module:** GPIO35/36 can be occupied by octal flash/PSRAM on some modules. These pins must be available on your exact board. The default build targets `esp32-s3-devkitc-1`, with no PSRAM dependency. Change the board configuration if your flash/USB hardware differs.
+**Check your ESP32-S3 module:** GPIO35/36 can be occupied by octal flash/PSRAM on some modules. These pins must be available on your exact board. The build uses `esp32-s3-devkitc-1` with explicit **4 MB flash** and `default.csv` (4 MB) partition overrides, with no PSRAM dependency. The stock board definition otherwise assumes 8 MB. Change the board configuration if your flash/USB hardware differs.
 
 ## Build and flash
 
@@ -89,3 +89,15 @@ Host tests exercise the actual TLV parser, including truncation, indefinite leng
 - [PN532 user manual (NXP)](https://www.nxp.com/docs/en/user-guide/141520.pdf): host framing, I2C status polling, InListPassiveTarget and InDataExchange.
 - [Adafruit PN532 implementation](https://github.com/adafruit/Adafruit-PN532): reference for PN532 commands and transport behavior.
 - [EMV specifications (EMVCo)](https://www.emvco.com/specifications/): Book 2 security/key management and Book 3 application protocol. The synthetic ECDSA workflow deliberately does not claim EMV conformance.
+
+## Recovery from a flash-size boot loop
+
+`Detected size(4096k) smaller than ... header(8192k)` means an 8 MB image was flashed to a 4 MB chip. This build now explicitly uses 4 MB for the image header and partition table. Reflash the complete rebuilt image (including bootloader and partitions), not just the application binary:
+
+```sh
+python -m esptool --chip esp32s3 --port /dev/YOUR_PORT write_flash 0x0 firmware/merged.bin
+```
+
+Alternatively use `pio run -t upload --upload-port /dev/YOUR_PORT`, which writes the bootloader and partitions as well. If the board keeps rebooting during connection, hold BOOT, tap RESET, then release BOOT to enter the ROM downloader.
+
+The `do_core_init ... flash_ret == ESP_OK` assertion follows the flash-size probe failure. Correct that mismatch first. If a core-dump warning alone remains after normal boot is restored, stale flash data may need clearing. A full `erase_flash` also removes all saved settings; it is not required as the first recovery step.
