@@ -1,6 +1,6 @@
 # ESP32-S3 NFC / PKI Lab
 
-A self-contained feasibility demo: an ESP32-S3 reads ISO14443A cards using a PN532, hosts a local dashboard, inspects public EMV data, and demonstrates signing and verification using synthetic keys. No cloud, processor, external web assets, or delegated computation.
+An entirely local ESP32-S3 / PN532 feasibility demo. Tap a card to read public EMV data, stream it to a web dashboard, and request a card signature when DDA is supported. No cloud or payment processor is involved.
 
 ## Hardware
 
@@ -9,61 +9,79 @@ A self-contained feasibility demo: an ESP32-S3 reads ISO14443A cards using a PN5
 | GPIO35 | SDA |
 | GPIO36 | SCL |
 | GND | GND |
-| Board-appropriate supply | VCC |
+| Module-appropriate supply | VCC |
 
-Set the PN532 module switches/jumpers to **I2C** (7-bit address `0x24`). Use 3.3 V logic and pull-ups to 3.3 V; check your module's power specification. IRQ/reset are not required: the driver polls the PN532 I2C status byte. Wiring is configured in `setup()` in `src/main.cpp`.
+Set the PN532 switches/jumpers to **I2C**, address `0x24`, then power-cycle. Use 3.3 V logic and pull-ups to 3.3 V. IRQ/reset are not required. Some ESP32-S3 memory variants reserve GPIO35/36; check that these pins are available on your module.
 
-**Check your ESP32-S3 module:** GPIO35/36 can be occupied by octal flash/PSRAM on some modules. These pins must be available on your exact board. The build uses `esp32-s3-devkitc-1` with explicit **4 MB flash** and `default.csv` (4 MB) partition overrides, with no PSRAM dependency. The stock board definition otherwise assumes 8 MB. Change the board configuration if your flash/USB hardware differs.
+The build uses `esp32-s3-devkitc-1` with **4 MB flash** and a 4 MB `default.csv` partition override, without PSRAM. This overrides the board definition's stock 8 MB assumption.
 
 ## Build and flash
 
-Requires Python 3.12 and PlatformIO Core 6.1.18:
+Requires Python 3.12, a C++ compiler for host tests, and Node.js 20+ for UI tests:
 
 ```sh
 python -m pip install platformio==6.1.18 esptool==4.8.1
 python scripts/test_tlv.py
+node --test tests/ui.test.cjs
 pio run
 pio run -t upload --upload-port /dev/YOUR_PORT
 pio device monitor --baud 115200
 ```
 
-Open the serial monitor and reset the board. It prints the randomly generated WiFi password. Join **ESP32-NFC-Lab**, then open **http://192.168.4.1**. Password and demo keys change on every restart. The board operates as an access point; internet access is not needed. The UI is compiled into firmware, so no filesystem upload is needed.
+Join **ESP32-NFC-Lab** (open WiFi, no password), then open **http://192.168.4.1**. Internet access and a filesystem upload are not needed. HTML and JavaScript are embedded into the application image.
 
-Hold one card steady and press **Scan card**. Inspection takes several seconds; the synchronous web server may pause while PN532 commands complete. Use **Clear** to discard the last result. There is no scan history or persistent card database. A missing reader can be retried with Scan after correcting wiring.
+Package a merged image after compiling:
 
-## Card inspection
+```sh
+python scripts/package.py
+python -m esptool --chip esp32s3 --port /dev/YOUR_PORT write_flash 0x0 firmware/merged.bin
+```
 
-The bounded APDU sequence is:
+The merged image includes bootloader `0x0`, partitions `0x8000`, Arduino boot selector `0xe000`, and application `0x10000`. Packaging rejects incorrect flash-size headers and partitions extending past 4 MB. Flashing replaces existing firmware. If a reboot loop prevents connection, hold BOOT, tap RESET, then release BOOT to enter the ROM downloader.
 
-1. ISO14443A discovery: show UID (which can change and is not proof of identity).
-2. SELECT `2PAY.SYS.DDF01` and select the first advertised payment AID.
-3. Parse PDOL; issue GET PROCESSING OPTIONS with zero amount, a hardware-random unpredictable number, and minimal terminal data.
-4. Read at most 32 AFL records. Show application label, masked PAN (last four only), AIP, CA key index, issuer/ICC certificates and any signed dynamic application data encountered.
+## Tap and push workflow
 
-The UI shows command status words, not raw APDU traces or full PAN/track data. Full responses exist transiently in RAM while parsing and are not logged or persisted. No protected files are accessed, no PIN is attempted, and no GENERATE AC or write commands are sent. **GPO may change a payment card's internal state or counters even with zero amount.** This is inspection, not a guaranteed stateless read operation.
+1. Firmware polls the PN532 approximately every 500 ms while idle. A newly detected UID starts inspection. Holding the same card in place does not repeatedly scan/sign; remove it for two absent polls and tap again. **Scan again** forces another scan.
+2. SELECT PPSE (`2PAY.SYS.DDF01`), select the first advertised payment application, send zero-amount GET PROCESSING OPTIONS, then read up to 32 AFL records.
+3. Push the initial scan to connected clients over **WebSocket port 81** (`ws://192.168.4.1:81/`). No browser polling is used for card data.
+4. After a completed inspection, check the AIP DDA bit. For a supported DDOL, generate a fresh unpredictable number and send **INTERNAL AUTHENTICATE** to the actual card.
+5. Push the signing status, challenge, APDU status words and signature bytes as an update to the same card row.
 
-Limits: ISO14443A only, first payment app only, short APDUs, at most 120 PDOL data bytes, 32 records, bounded TLV recursion, no GET RESPONSE/6C retry, no scheme-specific contactless kernel. Unsupported cards and mobile wallets may fail or return limited data. Non-payment ISO14443A tags show their UID and an unavailable-directory status. PAR is deliberately not used as an access identifier; its availability and cross-device stability are not universal.
+Keep the card on the reader until signing completes. Unsupported DDA, unsupported DDOL, card rejection, partial inspection and transport failure are explicit outcomes. A signature supplied by GPO is displayed separately from the requested signature.
 
-## Signing demo: what is actually verified
+The synchronous NFC driver can pause HTTP handling while a command completes. WebSocket clients are serviced between APDUs. The firmware retries reader initialization every five seconds after a transport error.
 
-**Run signing & verification** performs real ECDSA P-256 / SHA-256 operations on the ESP32 using mbedTLS:
+## Card list and data
 
-- Root signs the issuer's public key; verify with root public key.
-- Issuer signs the synthetic card's public key; verify with issuer public key.
-- Synthetic card signs a fresh 32-byte challenge; verify with card public key.
-- Verify that the same signature fails against a changed challenge and a new challenge.
+Rows use the **full PAN** decoded from `5A` or `57`; two PANs sharing the same last four digits remain separate. When no PAN is available, UID is the explicit fallback. Changing a UID does not create another row when the PAN stays the same. PANs are displayed in full as requested. Different physical cards/wallet tokens may present different PANs; PAN/UID matching is not proof of identity or authenticity.
 
-The dashboard exposes public keys, signatures, challenge, and all five pass/fail results. Private keys remain in ESP32 RAM and are regenerated at boot. These simple public-key endorsements illustrate a PKI chain; they are not X.509 or EMV certificates. The freshly generated root is a local demo trust anchor, not a scheme CA. This demonstrates signature mathematics and freshness; a deployed protocol must also track issued challenges and bind them to sessions.
+Each row includes application, tap count, scan status and signing status. Expand **Fields & signing** for every returned primitive TLV (known and unknown tags), hex bytes, printable text where applicable, challenge, signature and APDU results. This includes publicly returned PAN, track data, expiry, labels, capability fields and certificates when present. Constructed TLVs are traversed, rather than duplicated as whole raw blobs.
 
-**Live payment-card authentication is not implemented.** Certificate and signature bytes from a real card are explicitly unverified. This project does not recover EMV RSA issuer/ICC public keys, provision/validate scheme CAPKs, build offline-authentication record hashes, request DDA, or implement fDDA/CDA verification. A real card's private key cannot be extracted; the synthetic demo does not use it. Offline authentication would also not establish issuer approval, revocation status, cardholder identity, or resistance to live relay attacks. This firmware must not open an actual door on the basis of a UID, masked PAN, certificate presence, or synthetic demo result.
+The device retains four distinct cards in RAM for reconnects, replacing older slots. Tap counts cover the retained device entry. A browser tab holds up to 32 rows. No browser storage, flash database, or serial card-data log is used. **Clear cards** clears the device history and all connected UIs. Data, including full PANs, is visible to clients of the open local network.
 
-For a next hardware feasibility step, capture which target cards provide certificates and AIP, then implement one specified contactless kernel and validate it with known cryptographic test vectors and supported test cards. The earlier chat's claim that processor zero-value checks and PAR universally solve entry identification was too broad; this project makes no such assumption.
+Per scan, at most 128 unique primitive tag/value pairs and 8 KB of hex values are retained; truncation is indicated in the UI. Other limits: ISO14443A only, first payment app only, short APDUs, 120 PDOL bytes, 32 AFL records and bounded TLV nesting. PN532 response chaining is collected up to eight fragments / 1024 bytes. No APDU GET RESPONSE / `6C` retry or scheme-specific contactless kernel is implemented. A nonpayment tag shows its UID and an unavailable-directory result.
 
-## CI and release artifacts
+## Signing and verification
 
-The repository starts on `master`. `.github/workflows/firmware.yml` builds master pushes, pull requests to master, `v*` tags, published releases, and manual runs. It runs the host TLV tests, compiles firmware, packages it, and uploads a downloadable Actions artifact. Tag pushes create a GitHub release if needed; published releases attach to their existing release. Both attach the individual images, merged image, ELF, flash layout, README, and SHA256 checksums. The workflow needs repository contents write permission for release uploads.
+The live signing path sends `00 88 00 00 Lc <DDOL input> 00` only when a completed scan advertises DDA. It supports card DDOL `9F3704` (a four-byte unpredictable number). If the card omits DDOL, the terminal default `9F3704` is used. Unknown/malformed DDOLs are reported as unsupported; no signing command is sent. Responses in template `80` or signed dynamic application data `9F4B` are displayed.
 
-After creating a GitHub repository and configuring `origin`:
+**Receiving a signature is not verifying it.** Real EMV RSA issuer/ICC certificate recovery, scheme CAPK provisioning, offline record hashes and signature validation are not implemented. DDA support in AIP does not guarantee that a contactless application will accept INTERNAL AUTHENTICATE. fDDA/CDA and issuer authorization are not implemented. This demo must not authorize real entry based on these results.
+
+The separate **synthetic PKI demonstration** retains the original on-device ECDSA P-256 / SHA-256 workflow: root signs issuer public key, issuer signs demo-card public key, demo-card signs a fresh challenge; both chain links and the signature are verified, and modified/fresh challenges reject the original signature. Keys are regenerated at boot. These simple endorsements are not EMV/X.509 certificates and do not involve the tapped card.
+
+No GENERATE AC, PIN attempts, protected-file access, card writes or payment authorization are issued. GPO and signing requests may change internal card state/counters.
+
+## WebSocket events
+
+The server sends JSON `{ "type": "card", "card": { ... } }` for initial scans and signing updates, using the same `scanId` for both. A repeated tap gets a new scan ID. Events include `key`, `pan` (when available), `uid`, `taps`, `fields`, `steps`, `signingStatus`, and available signing data. `reader` events report reader health; `clear` clears history. A new socket connection receives reader health and each retained card. The browser reconnects automatically, ignores older scan versions of a known card, and resets its list when the reader reports a new boot ID.
+
+HTTP endpoints remain: `GET /`, `GET /api/state` (latest scan diagnostics), `POST /api/scan`, `POST /api/clear`, `POST /api/demo` (synthetic demo).
+
+## CI and releases
+
+Git is initialized on `master`. The GitHub Actions workflow tests and builds master pushes, PRs targeting master, `v*` tags, published releases and manual dispatches. It uploads Actions artifacts and attaches the merged image, individual images, ELF, flash layout, README and SHA256 checksums to releases. A `v*` tag creates a release if needed. Release uploads require repository contents write permission.
+
+Once `origin` is configured and the changes are committed:
 
 ```sh
 git push -u origin master
@@ -71,33 +89,34 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-Package locally after a build:
+## Validation and troubleshooting
 
-```sh
-python scripts/package.py
-python -m esptool --chip esp32s3 --port /dev/YOUR_PORT write_flash 0x0 firmware/merged.bin
-```
+Host tests cover TLV boundaries, malformed lengths, PAN extraction/padding, DDOL challenge construction, PN532 short/extended frames, transient readiness failures, full-frame read recovery, persistent failures, chained responses, NAD stripping, RF error codes and response limits. UI tests cover PAN deduplication, signing updates to an existing row, equal last-four collisions, stale updates, UID fallback and bounded lists. Firmware compilation and artifact validation do not replace physical hardware tests.
 
-Merged image layout: bootloader `0x0`, partitions `0x8000`, Arduino boot selector `0xe000`, application `0x10000`. Flashing can overwrite existing firmware/settings. Individual images can instead be flashed at the offsets in `flash-layout.json`.
+On hardware, connect two dashboard tabs, tap one supported card, confirm both receive one row before the signing result, remove and retap it, and confirm the same row's count increments. Verify unsupported signing statuses, reconnect snapshots, and clear propagation. Keep the card present until completion.
 
-## Validation
+- `Detected size(4096k) ... header(8192k)`: flash the complete rebuilt 4 MB merged image, including bootloader/partitions. Uploading only the application leaves the old bootloader in place.
+- `Wire.cpp ... i2cRead returned Error -1`: bus read failed; inspect `readerError`. Check I2C mode, wiring, module power, pull-ups and pin availability. Power-cycle after mode changes. A PN532 must ACK at `0x24`; card presence is not needed for initialization.
 
-Host tests exercise the actual TLV parser, including truncation, indefinite length rejection, oversized tags, nested templates and long-form lengths. A successful firmware build checks compilation/linking; hardware verification still requires the physical board, PN532 and cards. On hardware, check reader detection, scan a non-payment tag, scan your own supported payment card, confirm PAN masking, run the PKI demo (all five booleans should be true), clear the result, and reboot to confirm new keys/password.
+The driver reads a response header, requests PN532 NACK retransmission, then reads the exact frame length, rather than clocking a fixed oversized response. It tolerates up to two transient address/read failures during readiness polling, then stops after the third. A failed response-frame read is retried once using PN532 NACK retransmission, which fetches the saved response without executing the card command again.
 
 ## References
 
-- [PN532 user manual (NXP)](https://www.nxp.com/docs/en/user-guide/141520.pdf): host framing, I2C status polling, InListPassiveTarget and InDataExchange.
-- [Adafruit PN532 implementation](https://github.com/adafruit/Adafruit-PN532): reference for PN532 commands and transport behavior.
-- [EMV specifications (EMVCo)](https://www.emvco.com/specifications/): Book 2 security/key management and Book 3 application protocol. The synthetic ECDSA workflow deliberately does not claim EMV conformance.
+- [NXP PN532 user manual](https://www.nxp.com/docs/en/user-guide/141520.pdf)
+- [ESPHome PN532 I2C transport](https://github.com/esphome/esphome/blob/dev/esphome/components/pn532_i2c/pn532_i2c.cpp)
+- [Arduino WebSockets](https://github.com/Links2004/arduinoWebSockets)
+- [EMVCo specifications](https://www.emvco.com/specifications/) — Books 2 and 3 describe dynamic authentication and the application protocol.
 
-## Recovery from a flash-size boot loop
+### Interrupted inspection diagnostics
 
-`Detected size(4096k) smaller than ... header(8192k)` means an 8 MB image was flashed to a 4 MB chip. This build now explicitly uses 4 MB for the image header and partition table. Reflash the complete rebuilt image (including bootloader and partitions), not just the application binary:
+An interrupted record read now reports `READ RECORD SFI=<n> record=<n>` with the failure reason. Expand APDU results for `transportPhase`, `i2cReadRequested`, `i2cReadReceived`, and `pn532Status` when available. Partial public fields remain visible; signing is skipped after incomplete inspection.
 
-```sh
-python -m esptool --chip esp32s3 --port /dev/YOUR_PORT write_flash 0x0 firmware/merged.bin
-```
+A reported read failure after earlier `9000` results indicates a host-side read/transport failure, not an APDU rejection. Readiness polling tolerates short address-NACK windows documented by NXP. A failed full response read gets one saved-frame retransmission attempt. Remaining failures are reported rather than restarting the whole payment-card sequence. The Arduino I2C layer can still print a low-level error for an attempt that the driver subsequently recovers.
 
-Alternatively use `pio run -t upload --upload-port /dev/YOUR_PORT`, which writes the bootloader and partitions as well. If the board keeps rebooting during connection, hold BOOT, tap RESET, then release BOOT to enter the ROM downloader.
+The driver also handles the PN532 status MI bit as a continuation indication rather than an error, collecting the remaining response with an empty InDataExchange request. PN532 RF errors retain their numeric status and a decoded explanation. These recovery paths are host-tested; the exact cause of an intermittent physical I2C failure still requires the new diagnostics and hardware verification.
 
-The `do_core_init ... flash_ret == ESP_OK` assertion follows the flash-size probe failure. Correct that mismatch first. If a core-dump warning alone remains after normal boot is restored, stale flash data may need clearing. A full `erase_flash` also removes all saved settings; it is not required as the first recovery step.
+### Fixed: requested 270 bytes, received 14
+
+Arduino-ESP32 2.x has legacy two-argument `Wire.requestFrom` overloads returning `uint8_t`. The driver selected one of these: the actual read could succeed with all 270 bytes buffered, while the return count wrapped to 14 (`270 % 256`). The driver then incorrectly rejected and discarded the successful read.
+
+The driver now explicitly calls `requestFrom(uint16_t address, size_t length, bool stop)`, which returns `size_t`. The host Wire stub mirrors the real overloads, and regression tests reproduce the old 270-to-14 behavior and validate reads across the 255/256 boundary and the exact 270-byte frame. Retry logic alone cannot correct an 8-bit return-value truncation.
