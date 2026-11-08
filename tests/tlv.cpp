@@ -3,6 +3,8 @@
 #include <cstring>
 #include <cassert>
 int main(){
+ uint8_t ttq[4];terminalTtq(true,ttq);const uint8_t visaTtq[]={0x27,0x80,0,0};assert(!std::memcmp(ttq,visaTtq,4));
+ terminalTtq(false,ttq);const uint8_t genericTtq[]={0x26,0,0,0};assert(!std::memcmp(ttq,genericTtq,4));
  char pan[20];const uint8_t panBytes[]={0x12,0x34,0x56,0x78,0x90,0x12,0x34,0x5f};
  assert(decodePan(panBytes,sizeof(panBytes),false,pan,sizeof(pan)));assert(!std::strcmp(pan,"123456789012345"));
  const uint8_t track[]={0x12,0x34,0x56,0x78,0x90,0x12,0x34,0x56,0xd2,0x70,0x11};

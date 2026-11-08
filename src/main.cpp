@@ -80,7 +80,9 @@ bool apdu(const char *name,const uint8_t *cmd,size_t n){
  }
  uint16_t sw=(response[responseSize-2]<<8)|response[responseSize-1];responseSize-=2;uint8_t swBytes[]={uint8_t(sw>>8),uint8_t(sw)};log["status"]=hex(swBytes,2);
  sockets.loop();
- if(sw!=0x9000)return false;inspect(response,responseSize);return true;
+ if(sw!=0x9000)return false;inspect(response,responseSize);
+ Tlv signature;if(findTag(response,responseSize,0x9f4b,signature))state["dynamicSignatureSource"]=String(name);
+ return true;
 }
 void scan(const uint8_t *uid,size_t uidSize){
  state.clear();fieldBytes=0;ddolSize=0;ddolPresent=false;
@@ -91,6 +93,9 @@ void scan(const uint8_t *uid,size_t uidSize){
  if(!apdu("SELECT PPSE",selectPpse,sizeof(selectPpse))){state["status"]=apduTransportFailed?"Transport failed during SELECT PPSE":"Card found; payment directory unavailable";return;}
  Tlv aid;if(!findTag(response,responseSize,0x4f,aid) || aid.size<5 || aid.size>16){state["status"]="No supported payment application in PPSE";return;}
  state["aid"]=hex(aid.data,aid.size);
+ bool visa=state["aid"].as<String>().startsWith("A000000003");
+ state["signingMethod"]=visa?"Visa fDDA capture via GPO":"Standalone DDA if advertised";
+ state["fddaRequested"]=false;
  uint8_t select[22]={0,0xa4,4,0,uint8_t(aid.size)};memcpy(select+5,aid.data,aid.size);select[5+aid.size]=0;
  if(!apdu("SELECT payment application",select,aid.size+6)){state["status"]=apduTransportFailed?"Transport failed selecting payment application":"Payment application selection rejected";return;}
  // Fill PDOL using neutral terminal values and a fresh unpredictable number.
@@ -101,8 +106,12 @@ void scan(const uint8_t *uid,size_t uidSize){
    if(p>=pdol.size)return;size_t len=pdol.data[p++];if(total+len>120){state["status"]="PDOL too large";return;}
    memset(gpo+7+total,0,len);
    if(tag==0x9f37 && len==4)memcpy(gpo+7+total,nonce,4);
-   if(tag==0x9f66 && len==4){gpo[7+total]=0x26;gpo[8+total]=0;}
+   if(tag==0x9f66 && len==4){
+    terminalTtq(visa,gpo+7+total);state["terminalTtq"]=hex(gpo+7+total,4);state["fddaRequested"]=visa;
+   }
    if((tag==0x9f1a || tag==0x5f2a) && len==2){gpo[7+total]=0x03;gpo[8+total]=0x56;}
+   String terminalTag=String(tag,HEX);terminalTag.toUpperCase();if(terminalTag.length()%2)terminalTag="0"+terminalTag;
+   state["terminalData"][terminalTag]=hex(gpo+7+total,len);
    total+=len;
   }
  }
@@ -129,10 +138,22 @@ void requestCardSignature(){
  if(state["status"].as<String>()!="Inspection complete"){
   state["signingStatus"]="Not requested: initial inspection did not complete";return;
  }
+ if(state["fddaRequested"].as<bool>())state["signingChallenge"]=state["challenge"].as<String>();
+ // Contactless fDDA may already return signed data during inspection.
+ if(state["dynamicSignature"].is<String>()){
+  state["signingStatus"]=String("Dynamic signature received in ")+(state["dynamicSignatureSource"] | "inspection")+" — unverified; separate DDA not requested";
+  return;
+ }
+ if(state["aid"].as<String>().startsWith("A000000003")){
+  state["signingChallenge"]=state["challenge"].as<String>();
+  state["signingStatus"]=state["fddaRequested"].as<bool>()?
+    "Visa fDDA requested during GPO; no signature (9F4B) returned":
+    "Visa fDDA not requested: PDOL did not include a supported TTQ";
+  return; // Visa contactless fDDA does not use INTERNAL AUTHENTICATE.
+ }
  String aip=state["aip"] | "";
  if(aip.length()<2 || !(strtoul(aip.substring(0,2).c_str(),nullptr,16)&0x20)){
-  state["signingStatus"]="Unsupported: selected application does not advertise DDA";
-  if(state["dynamicSignature"].is<String>())state["signingStatus"]="GPO supplied a dynamic signature (unverified); no separate DDA advertised";
+  state["signingStatus"]="No standalone DDA advertised; other authentication modes are not implemented";
   return;
  }
  uint8_t nonce[4];esp_fill_random(nonce,4);state["signingChallenge"]=hex(nonce,4);
@@ -143,8 +164,23 @@ void requestCardSignature(){
  }
  state["signingStatus"]="Requesting card signature";publishCard();sockets.loop();
  uint8_t cmd[70]={0,0x88,0,0,uint8_t(inputSize)};memcpy(cmd+5,input,inputSize);cmd[5+inputSize]=0;
- if(!apdu("INTERNAL AUTHENTICATE",cmd,inputSize+6)){
-  state["signingStatus"]="Signing request failed or rejected; inspect APDU status";return;
+ bool accepted=apdu("INTERNAL AUTHENTICATE",cmd,inputSize+6);
+ JsonObject result=state["steps"][state["steps"].size()-1].as<JsonObject>();
+ state["signingResponse"].set(result);
+ if(!accepted){
+  if(apduTransportFailed)state["signingStatus"]=String("Signing transport failure: ")+result["detail"].as<String>();
+  else{
+   String sw=result["status"].as<String>();const char *reason="card rejected command";
+   if(sw=="6D00")reason="INTERNAL AUTHENTICATE instruction not supported";
+   else if(sw=="6A81")reason="requested function not supported";
+   else if(sw=="6985")reason="conditions of use not satisfied";
+   else if(sw=="6982")reason="security conditions not satisfied";
+   else if(sw=="6700")reason="incorrect command length";
+   else if(sw=="6A80")reason="incorrect command data";
+   else if(sw=="6A86")reason="incorrect command parameters";
+   state["signingStatus"]=String("INTERNAL AUTHENTICATE ")+sw+": "+reason;
+  }
+  return;
  }
  Tlv signedData;
  if(findTag(response,responseSize,0x9f4b,signedData) || findTag(response,responseSize,0x80,signedData)){

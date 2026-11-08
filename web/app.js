@@ -17,7 +17,7 @@ if(typeof document!=='undefined'){
   for(const c of [...cards.values()].reverse()){
    const row=node('tr');for(const value of [c.pan||`UID ${c.uid}`,c.application||c.aid||'Unknown',c.taps||1,c.status,c.signingStatus])row.append(node('td',String(value||'—')));
    const cell=node('td'),detail=node('details');detail.append(node('summary','Fields & signing'));
-   const meta={uid:c.uid,aid:c.aid,aip:c.aip,scanId:c.scanId,seenMs:c.seenMs,verification:c.verification,signingChallenge:c.signingChallenge,ddolSource:c.ddolSource,requestedSignature:c.requestedSignature,dynamicSignature:c.dynamicSignature,readerError:c.readerError,failure:c.failure};
+   const meta={uid:c.uid,aid:c.aid,aip:c.aip,scanId:c.scanId,seenMs:c.seenMs,verification:c.verification,signingMethod:c.signingMethod,fddaRequested:c.fddaRequested,terminalTtq:c.terminalTtq,terminalData:c.terminalData,signingChallenge:c.signingChallenge,ddolSource:c.ddolSource,signingResponse:c.signingResponse,requestedSignature:c.requestedSignature,dynamicSignatureSource:c.dynamicSignatureSource,dynamicSignature:c.dynamicSignature,readerError:c.readerError,failure:c.failure};
    detail.append(node('pre',JSON.stringify(meta,null,2)));
    if(c.fieldsTruncated)detail.append(node('p','Field display truncated at the device RAM limit (128 fields / 8 KB hex).'));
    const table=node('table'),head=node('tr');for(const name of ['Tag','Hex value','Printable text'])head.append(node('th',name));table.append(head);

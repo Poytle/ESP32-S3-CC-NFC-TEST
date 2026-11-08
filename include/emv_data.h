@@ -18,3 +18,8 @@ inline bool ddaInput(const uint8_t *ddol,size_t size,const uint8_t nonce[4],uint
  if(size!=3 || ddol[0]!=0x9f || ddol[1]!=0x37 || ddol[2]!=4 || length<4)return false;
  for(size_t i=0;i<4;i++)out[i]=nonce[i];length=4;return true;
 }
+// Experimental Visa fDDA capture: qVSDC + ODA-for-online, online cryptogram required.
+// These are capture parameters; the demo does not claim terminal/EMV compliance.
+inline void terminalTtq(bool visaFdda,uint8_t out[4]){
+ out[0]=visaFdda?0x27:0x26;out[1]=visaFdda?0x80:0;out[2]=0;out[3]=0;
+}

@@ -44,10 +44,10 @@ The merged image includes bootloader `0x0`, partitions `0x8000`, Arduino boot se
 1. Firmware polls the PN532 approximately every 500 ms while idle. A newly detected UID starts inspection. Holding the same card in place does not repeatedly scan/sign; remove it for two absent polls and tap again. **Scan again** forces another scan.
 2. SELECT PPSE (`2PAY.SYS.DDF01`), select the first advertised payment application, send zero-amount GET PROCESSING OPTIONS, then read up to 32 AFL records.
 3. Push the initial scan to connected clients over **WebSocket port 81** (`ws://192.168.4.1:81/`). No browser polling is used for card data.
-4. After a completed inspection, check the AIP DDA bit. For a supported DDOL, generate a fresh unpredictable number and send **INTERNAL AUTHENTICATE** to the actual card.
+4. For Visa applications, collect fDDA signature data requested during GPO. For other applications, after completed inspection check the AIP DDA bit and send **INTERNAL AUTHENTICATE** with a fresh challenge when the DDOL is supported.
 5. Push the signing status, challenge, APDU status words and signature bytes as an update to the same card row.
 
-Keep the card on the reader until signing completes. Unsupported DDA, unsupported DDOL, card rejection, partial inspection and transport failure are explicit outcomes. A signature supplied by GPO is displayed separately from the requested signature.
+Keep the card on the reader until signing completes. Unsupported DDA, unsupported DDOL, card rejection, partial inspection and transport failure are explicit outcomes. A signature supplied during inspection (for example, fDDA during GPO) is displayed with its source command; when present, it is used as the signing result and no separate INTERNAL AUTHENTICATE is requested.
 
 The synchronous NFC driver can pause HTTP handling while a command completes. WebSocket clients are serviced between APDUs. The firmware retries reader initialization every five seconds after a transport error.
 
@@ -63,7 +63,7 @@ Per scan, at most 128 unique primitive tag/value pairs and 8 KB of hex values ar
 
 ## Signing and verification
 
-The live signing path sends `00 88 00 00 Lc <DDOL input> 00` only when a completed scan advertises DDA. It supports card DDOL `9F3704` (a four-byte unpredictable number). If the card omits DDOL, the terminal default `9F3704` is used. Unknown/malformed DDOLs are reported as unsupported; no signing command is sent. Responses in template `80` or signed dynamic application data `9F4B` are displayed.
+The standalone signing path for non-Visa applications sends `00 88 00 00 Lc <DDOL input> 00` only when a completed scan advertises DDA. It supports card DDOL `9F3704` (a four-byte unpredictable number). If the card omits DDOL, the terminal default `9F3704` is used. Unknown/malformed DDOLs are reported as unsupported; no signing command is sent. Responses in template `80` or signed dynamic application data `9F4B` are displayed.
 
 **Receiving a signature is not verifying it.** Real EMV RSA issuer/ICC certificate recovery, scheme CAPK provisioning, offline record hashes and signature validation are not implemented. DDA support in AIP does not guarantee that a contactless application will accept INTERNAL AUTHENTICATE. fDDA/CDA and issuer authorization are not implemented. This demo must not authorize real entry based on these results.
 
@@ -120,3 +120,19 @@ The driver also handles the PN532 status MI bit as a continuation indication rat
 Arduino-ESP32 2.x has legacy two-argument `Wire.requestFrom` overloads returning `uint8_t`. The driver selected one of these: the actual read could succeed with all 270 bytes buffered, while the return count wrapped to 14 (`270 % 256`). The driver then incorrectly rejected and discarded the successful read.
 
 The driver now explicitly calls `requestFrom(uint16_t address, size_t length, bool stop)`, which returns `size_t`. The host Wire stub mirrors the real overloads, and regression tests reproduce the old 270-to-14 behavior and validate reads across the 255/256 boundary and the exact 270-byte frame. Retry logic alone cannot correct an 8-bit return-value truncation.
+
+### Contactless signing results
+
+The AIP DDA bit does not guarantee that a contactless application accepts standalone INTERNAL AUTHENTICATE. Visa fDDA generates its signature during GPO, as described in [Visa TADG section 5.2.5](https://usa.visa.com/content/dam/VCOM/regional/na/us/partner-with-us/documents/transaction-acceptance-device-guide.pdf). The Visa capture profile described below requests fDDA, but full scheme-specific kernel processing and verification are not implemented. If inspection already returns signed dynamic data, the UI reports that result and source without issuing an extra DDA request.
+
+When standalone signing is attempted, its response is shown directly in the row and retained in `signingResponse`. Rejections show the status word and explanation, while transport failures show the transport detail. No standalone DDA advertised does not mean the card has no authentication capability; other modes may require a different protocol.
+
+### Visa `6A81` and the fDDA capture profile
+
+`6A81` on INTERNAL AUTHENTICATE means the requested function is unsupported. Visa contactless fDDA generates its signature as part of GPO, so the firmware now selects that capture path for the Visa RID `A000000003`. It no longer sends standalone INTERNAL AUTHENTICATE to Visa applications.
+
+When the card requests four-byte TTQ (`9F66`) in its PDOL, the experimental Visa capture profile supplies `27800000`: the existing qVSDC flags plus ODA-for-online and online-cryptogram-required. GPO also supplies a fresh unpredictable number, zero amount and configured currency where requested by the PDOL. The sent PDOL values are exposed as `terminalData`; `fddaRequested`, `terminalTtq` and `signingMethod` explain the chosen path. The returned `9F4B` and its source command are displayed without cryptographic verification. No signature returned is reported explicitly, rather than inferred as a successful authentication.
+
+This profile deliberately prompts signature generation for a protocol capture experiment. It does not implement the capabilities of a compliant fDDA verifier. GPO can generate local payment cryptograms and update counters; nothing is sent to an issuer, processor or network. Full EMV certificate recovery, trust-chain checks and signature validation remain unimplemented.
+
+References: [Visa TADG section 5.2.5](https://usa.visa.com/content/dam/VCOM/regional/na/us/partner-with-us/documents/transaction-acceptance-device-guide.pdf) describes GPO-based fDDA; [RFUID's EMV implementation](https://github.com/marksteward/RFUID/blob/master/emv.py) documents the TTQ flag layout used for this experimental capture profile.
