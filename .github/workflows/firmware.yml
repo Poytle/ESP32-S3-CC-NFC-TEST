@@ -22,6 +22,7 @@ jobs:
           python-version: '3.12'
       - run: pip install platformio==6.1.18 esptool==4.8.1
       - run: python scripts/test_tlv.py
+      - run: python scripts/test_pki.py
       - run: node --test tests/ui.test.cjs
       - run: pio run
       - run: python scripts/package.py

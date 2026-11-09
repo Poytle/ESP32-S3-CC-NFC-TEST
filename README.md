@@ -1,6 +1,28 @@
-# ESP32-S3 NFC / PKI Lab
+# ESP32-S3 NFC public-key enrollment and retap verification
 
-An entirely local ESP32-S3 / PN532 feasibility demo. Tap a card to read public EMV data, stream it to a web dashboard, and request a card signature when DDA is supported. No cloud or payment processor is involved.
+A local feasibility demo: recover an EMV card's RSA public key, explicitly enroll it after a verified dynamic signature, then verify fresh signatures against that saved key on retaps. All NFC, RSA recovery, hashing, verification, storage and web hosting run on the ESP32. PAN selects the enrollment; it never authenticates a tap.
+
+## Use it
+
+1. Flash the image below, join **ESP32-NFC-Lab** (open WiFi, no password), and open **https://192.168.4.1:433**. Port 80 redirects to this address.
+2. Run **RSA verifier self-test**. It exercises the actual ESP32 verifier with synthetic public-only RSA fixtures, including rejection cases.
+3. Tap a card. If not already enrolled, its row shows the required **CAPK RID and index**.
+4. Obtain the matching scheme CA public key through a source you trust. Import its public modulus/exponent in the CAPK form. There are no bundled production scheme keys, and the firmware does not download keys.
+5. Retap. The ESP recovers the issuer key and ICC key, checks certificate hashes and PAN bindings, then verifies the dynamic signature against the current challenge. The row exposes the recovered RSA modulus, exponent and SHA-256 fingerprint.
+6. Press **Enroll public key** after signature verification succeeds. Remove the card and retap: **RETAP VERIFIED** requires a fresh valid signature under the enrolled key. Changing the key under the same PAN does not silently replace enrollment.
+
+Example CAPK schema (placeholders are not usable keys):
+
+```json
+{
+  "rid": "A000000003",
+  "index": "HEX_CA_INDEX_FROM_CARD",
+  "modulus": "HEX_PUBLIC_RSA_MODULUS_FROM_CAPK_SOURCE",
+  "exponent": "03"
+}
+```
+
+RID is five bytes (10 hex characters), index one byte (two hex characters); modulus is 64–256 bytes, exponent `03` or `010001`. One CAPK configuration is retained; it can be replaced to enroll a card under a different root. Existing enrolled keys do not depend on keeping that CAPK configured for retaps.
 
 ## Hardware
 
@@ -11,128 +33,128 @@ An entirely local ESP32-S3 / PN532 feasibility demo. Tap a card to read public E
 | GND | GND |
 | Module-appropriate supply | VCC |
 
-Set the PN532 switches/jumpers to **I2C**, address `0x24`, then power-cycle. Use 3.3 V logic and pull-ups to 3.3 V. IRQ/reset are not required. Some ESP32-S3 memory variants reserve GPIO35/36; check that these pins are available on your module.
+Select PN532 **I2C mode**, then power-cycle. Address is `0x24`. Use 3.3 V logic/pull-ups and verify supply requirements for your module. IRQ/reset wires are not needed. Some ESP32-S3 memory variants reserve GPIO35/36; verify those pins are available.
 
-The build uses `esp32-s3-devkitc-1` with **4 MB flash** and a 4 MB `default.csv` partition override, without PSRAM. This overrides the board definition's stock 8 MB assumption.
+The project uses `esp32-s3-devkitc-1` with explicit **4 MB flash** and a 4 MB `default.csv` partition override, without PSRAM. This overrides the board definition's stock 8 MB assumption.
 
 ## Build and flash
 
-Requires Python 3.12, a C++ compiler for host tests, and Node.js 20+ for UI tests:
+Requires Python 3.12, a host C++ compiler and OpenSSL development headers for crypto tests, and Node.js 20+ for UI tests. On macOS, the host crypto test discovers Homebrew OpenSSL 3 automatically. Linux CI uses system OpenSSL development libraries.
 
 ```sh
 python -m pip install platformio==6.1.18 esptool==4.8.1
 python scripts/test_tlv.py
+python scripts/test_pki.py
 node --test tests/ui.test.cjs
 pio run
 pio run -t upload --upload-port /dev/YOUR_PORT
-pio device monitor --baud 115200
 ```
 
-Join **ESP32-NFC-Lab** (open WiFi, no password), then open **http://192.168.4.1**. Internet access and a filesystem upload are not needed. HTML and JavaScript are embedded into the application image.
-
-Package a merged image after compiling:
+Or package and flash the complete image:
 
 ```sh
 python scripts/package.py
 python -m esptool --chip esp32s3 --port /dev/YOUR_PORT write_flash 0x0 firmware/merged.bin
 ```
 
-The merged image includes bootloader `0x0`, partitions `0x8000`, Arduino boot selector `0xe000`, and application `0x10000`. Packaging rejects incorrect flash-size headers and partitions extending past 4 MB. Flashing replaces existing firmware. If a reboot loop prevents connection, hold BOOT, tap RESET, then release BOOT to enter the ROM downloader.
+Image layout: bootloader `0x0`, partitions `0x8000`, Arduino boot selector `0xe000`, application `0x10000`. Packaging rejects incorrect flash-size headers and partitions beyond 4 MB. Flashing replaces existing firmware. Hold BOOT, tap RESET, release BOOT if you need the ROM downloader during a boot loop. The UI is embedded; no filesystem upload is needed.
 
-## Tap and push workflow
+## Verification implemented
 
-1. Firmware polls the PN532 approximately every 500 ms while idle. A newly detected UID starts inspection. Holding the same card in place does not repeatedly scan/sign; remove it for two absent polls and tap again. **Scan again** forces another scan.
-2. SELECT PPSE (`2PAY.SYS.DDF01`), select the first advertised payment application, send zero-amount GET PROCESSING OPTIONS, then read up to 32 AFL records.
-3. Push the initial scan to connected clients over **WebSocket port 81** (`ws://192.168.4.1:81/`). No browser polling is used for card data.
-4. For Visa applications, collect fDDA signature data requested during GPO. For other applications, after completed inspection check the AIP DDA bit and send **INTERNAL AUTHENTICATE** with a fresh challenge when the DDOL is supported.
-5. Push the signing status, challenge, APDU status words and signature bytes as an update to the same card row.
+- Raw RSA public operations using mbedTLS on ESP32. This is EMV recovered-message verification, not PKCS#1 v1.5/PSS verification.
+- SHA-1 EMV issuer (`90`, `92`, `9F32`) and ICC (`9F46`, `9F48`, `9F47`) certificate recovery. Checks include formats, algorithms, lengths, key padding, PAN/issuer prefix binding and certificate hashes.
+- Offline static authentication input assembled from AFL-designated records. For SFI 1–10, exclude record template `70` and length; for SFI 11–30, include the whole record. Append AIP for static tag list `9F4A=82`. Unsupported tag lists and missing required records fail recovery.
+- DDA signed dynamic data verification using the current four-byte terminal challenge. DDOL `9F3704` or the terminal default is supported.
+- Visa fDDA v1 verification binds the GPO unpredictable number, amount, currency and Card Authentication Related Data (`9F69`, version 01). Missing/unsupported inputs fail explicitly. Visa GPO uses an experimental TTQ `27800000` capture profile and does not send standalone INTERNAL AUTHENTICATE.
+- Signature format, dynamic-data bounds, padding and full hash comparison. An old signature does not verify under a different challenge; wrong enrolled keys fail.
+- Explicit enrollment after initial successful certificate-hash recovery and fresh signature verification. Eight public keys maximum, saved in NVS. Enrollment is selected by SHA-256 of AID and PAN, and stores public key, fingerprint and AID. The digest is a lookup identifier, not a claim that PAN cannot be guessed.
 
-Keep the card on the reader until signing completes. Unsupported DDA, unsupported DDOL, card rejection, partial inspection and transport failure are explicit outcomes. A signature supplied during inspection (for example, fDDA during GPO) is displayed with its source command; when present, it is used as the signing result and no separate INTERNAL AUTHENTICATE is requested.
+Unenrolled cards require certificate recovery. Enrolled retaps verify with the saved key directly. `signatureVerified` records the cryptographic result; `retapVerified` is true only when that result is valid **and** the key was already enrolled. `chainTrusted` stays false because full bank trust policy is not implemented.
 
-The synchronous NFC driver can pause HTTP handling while a command completes. WebSocket clients are serviced between APDUs. The firmware retries reader initialization every five seconds after a transport error.
+## Scope and limits
 
-## Card list and data
+This verifies **continuity of the enrolled private key**, not bank approval, cardholder identity or absence of a live relay. CAPK provenance, certificate date/expiry policy and revocation are not validated. Certificate expiry encoding is checked but expiry dates are not enforced. Matching certificate hashes under a user-provided root is separate from trusting that root. Do not use this open-admin lab firmware as a deployed door controller.
 
-Rows use the **full PAN** decoded from `5A` or `57`; two PANs sharing the same last four digits remain separate. When no PAN is available, UID is the explicit fallback. Changing a UID does not create another row when the PAN stays the same. PANs are displayed in full as requested. Different physical cards/wallet tokens may present different PANs; PAN/UID matching is not proof of identity or authenticity.
+Supported cards must expose certificates at enrollment and return a supported dynamic signature. An online-only card or a card requiring CDA, XDA, ECC or another scheme-specific flow may remain unsupported. RSA moduli up to 256 bytes, exponents 3/65537 and SHA-1 EMV formats are supported; legacy fDDA variants without required version-01 inputs are rejected.
 
-Each row includes application, tap count, scan status and signing status. Expand **Fields & signing** for every returned primitive TLV (known and unknown tags), hex bytes, printable text where applicable, challenge, signature and APDU results. This includes publicly returned PAN, track data, expiry, labels, capability fields and certificates when present. Constructed TLVs are traversed, rather than duplicated as whole raw blobs.
+No GENERATE AC, PIN attempt, protected-file access or card write is issued. GPO/signature requests can generate local payment cryptograms and change card state/counters; nothing is submitted to a bank or processor.
 
-The device retains four distinct cards in RAM for reconnects, replacing older slots. Tap counts cover the retained device entry. A browser tab holds up to 32 rows. No browser storage, flash database, or serial card-data log is used. **Clear cards** clears the device history and all connected UIs. Data, including full PANs, is visible to clients of the open local network.
+The access point has no password as requested. HTTPS encrypts UI/API traffic, and WSS carries scan updates on the same TLS origin. Connected clients can still open the UI and change configuration/enrollment; admin authentication is not implemented.
 
-Per scan, at most 128 unique primitive tag/value pairs and 8 KB of hex values are retained; truncation is indicated in the UI. Other limits: ISO14443A only, first payment app only, short APDUs, 120 PDOL bytes, 32 AFL records and bounded TLV nesting. PN532 response chaining is collected up to eight fragments / 1024 bytes. No APDU GET RESPONSE / `6C` retry or scheme-specific contactless kernel is implemented. A nonpayment tag shows its UID and an unavailable-directory result.
+## Reader and dashboard
 
-## Signing and verification
+Idle polling is about every 500 ms. A new UID starts SELECT PPSE, selects the first payment application, sends zero-amount GPO and reads up to 32 AFL records. Hold the card until proof verification finishes. Holding the same card does not repeatedly sign; remove for two absent polls and tap again. **Scan again** forces another scan.
 
-The standalone signing path for non-Visa applications sends `00 88 00 00 Lc <DDOL input> 00` only when a completed scan advertises DDA. It supports card DDOL `9F3704` (a four-byte unpredictable number). If the card omits DDOL, the terminal default `9F3704` is used. Unknown/malformed DDOLs are reported as unsupported; no signing command is sent. Responses in template `80` or signed dynamic application data `9F4B` are displayed.
+The initial scan is pushed over WSS on HTTPS port 433 (`/ws`), followed by signing and verification updates. Rows are deduplicated by full PAN with UID fallback. All returned primitive EMV fields are available as hex/printable text, including full PANs as requested. One scan retains up to 128 tag/value pairs and 8 KB of hex values with an explicit truncation indicator.
 
-**Receiving a signature is not verifying it.** Real EMV RSA issuer/ICC certificate recovery, scheme CAPK provisioning, offline record hashes and signature validation are not implemented. DDA support in AIP does not guarantee that a contactless application will accept INTERNAL AUTHENTICATE. fDDA/CDA and issuer authorization are not implemented. This demo must not authorize real entry based on these results.
+Four scans are retained in device RAM for reconnects; a tab holds up to 32. No browser storage is used. **Clear cards** clears scan history only. Enrollment and the configured CAPK persist in NVS across reboots; use **Forget enrollment** to remove a saved key. Replacing a CAPK does not replace existing enrolled keys.
 
-The separate **synthetic PKI demonstration** retains the original on-device ECDSA P-256 / SHA-256 workflow: root signs issuer public key, issuer signs demo-card public key, demo-card signs a fresh challenge; both chain links and the signature are verified, and modified/fresh challenges reject the original signature. Keys are regenerated at boot. These simple endorsements are not EMV/X.509 certificates and do not involve the tapped card.
+Other bounds: ISO14443A only, first AID only, 120 PDOL bytes, eight PN532 response fragments / 1024 APDU response bytes, 8 KB offline record data, bounded TLV recursion. GET RESPONSE / `6C` retry and complete scheme kernels are not implemented.
 
-No GENERATE AC, PIN attempts, protected-file access, card writes or payment authorization are issued. GPO and signing requests may change internal card state/counters.
+## API and events
 
-## WebSocket events
+HTTPS on port 433: `GET /`, `GET /api/state`, `POST /api/scan`, `POST /api/clear`.
 
-The server sends JSON `{ "type": "card", "card": { ... } }` for initial scans and signing updates, using the same `scanId` for both. A repeated tap gets a new scan ID. Events include `key`, `pan` (when available), `uid`, `taps`, `fields`, `steps`, `signingStatus`, and available signing data. `reader` events report reader health; `clear` clears history. A new socket connection receives reader health and each retained card. The browser reconnects automatically, ignores older scan versions of a known card, and resets its list when the reader reports a new boot ID.
+PKI: `GET /api/pki`, `POST /api/pki/capk` (CAPK JSON), `POST /api/pki/enroll` (`id`, `scanId`), `POST /api/pki/forget` (`id`), `POST /api/pki/selftest`.
 
-HTTP endpoints remain: `GET /`, `GET /api/state` (latest scan diagnostics), `POST /api/scan`, `POST /api/clear`, `POST /api/demo` (synthetic demo).
+WebSocket messages use `{ "type": "card", "card": { ... } }` for scans/proofs. `reader` reports health and boot ID; `pki` reports public configuration/enrollment; `clear` clears history. Connection restores health, configuration and retained cards. The browser ignores older scan IDs and clears its scan list when boot ID changes.
 
-## CI and releases
+The older `POST /api/demo` ECDSA demonstration remains separate and cannot enroll/authenticate real cards.
 
-Git is initialized on `master`. The GitHub Actions workflow tests and builds master pushes, PRs targeting master, `v*` tags, published releases and manual dispatches. It uploads Actions artifacts and attaches the merged image, individual images, ELF, flash layout, README and SHA256 checksums to releases. A `v*` tag creates a release if needed. Release uploads require repository contents write permission.
+## Validation and CI
 
-Once `origin` is configured and the changes are committed:
+`test_pki.py` runs the same verification core against public-only synthetic RSA fixtures using host OpenSSL. Positive tests recover both certificate keys and verify DDA/fDDA. Negative tests reject wrong keys, changed challenges/amounts/card data, modified signatures, invalid padding, wrong static hashes, PAN mismatch, missing remainders and out-of-range signatures. The on-device self-test runs those checks through mbedTLS. No physical-card verification success is claimed by host tests.
 
-```sh
-git push -u origin master
-git tag v0.1.0
-git push origin v0.1.0
-```
+TLV/PN532 tests cover malformed data, PAN extraction, DDOL construction, extended I2C frames, 270-byte count handling, retries and chaining. Node tests cover PAN deduplication and stale updates. The fixture generator can regenerate synthetic public test data using Python cryptography; ephemeral private keys are never written.
 
-## Validation and troubleshooting
+GitHub Actions runs tests/builds on `master` pushes, PRs, `v*` tags, published releases and manual dispatches. It uploads Actions artifacts and attaches merged/individual images, ELF, README, flash layout and checksums to releases. A `v*` tag creates a release if needed. Configure `origin`, commit, then push `master` and a version tag to run it.
 
-Host tests cover TLV boundaries, malformed lengths, PAN extraction/padding, DDOL challenge construction, PN532 short/extended frames, transient readiness failures, full-frame read recovery, persistent failures, chained responses, NAD stripping, RF error codes and response limits. UI tests cover PAN deduplication, signing updates to an existing row, equal last-four collisions, stale updates, UID fallback and bounded lists. Firmware compilation and artifact validation do not replace physical hardware tests.
+Hardware acceptance: run RSA self-test; import a matching CAPK; enroll your supported card after proof succeeds; remove/retap and check `retapVerified=true`; reboot and retap to confirm persistence; test a different card and a same-PAN key change as failures; forget enrollment and confirm it no longer passes as an enrolled retap.
 
-On hardware, connect two dashboard tabs, tap one supported card, confirm both receive one row before the signing result, remove and retap it, and confirm the same row's count increments. Verify unsupported signing statuses, reconnect snapshots, and clear propagation. Keep the card present until completion.
+## Troubleshooting
 
-- `Detected size(4096k) ... header(8192k)`: flash the complete rebuilt 4 MB merged image, including bootloader/partitions. Uploading only the application leaves the old bootloader in place.
-- `Wire.cpp ... i2cRead returned Error -1`: bus read failed; inspect `readerError`. Check I2C mode, wiring, module power, pull-ups and pin availability. Power-cycle after mode changes. A PN532 must ACK at `0x24`; card presence is not needed for initialization.
-
-The driver reads a response header, requests PN532 NACK retransmission, then reads the exact frame length, rather than clocking a fixed oversized response. It tolerates up to two transient address/read failures during readiness polling, then stops after the third. A failed response-frame read is retried once using PN532 NACK retransmission, which fetches the saved response without executing the card command again.
+- `Detected size(4096k) ... header(8192k)`: flash the complete rebuilt 4 MB merged image, including bootloader and partitions.
+- I2C errors: inspect transport phase, requested/received counts and decoded PN532 status in APDU results. Check power, wiring, mode and pull-ups. The reader must ACK at `0x24`; no card is needed for initialization.
+- The former `requested 270, received 14` bug selected an Arduino Wire overload with an 8-bit return count. The driver now explicitly uses the `size_t` overload; regression tests model the actual overloads.
+- `6A81` on INTERNAL AUTHENTICATE means the requested function is unsupported. Visa takes the fDDA/GPO path; other cards may require unsupported modes.
+- Missing CAPK blocks initial public-key recovery. Missing certificates/static records, or unsupported/missing signature input, are shown separately from cryptographic failures.
 
 ## References
 
-- [NXP PN532 user manual](https://www.nxp.com/docs/en/user-guide/141520.pdf)
-- [ESPHome PN532 I2C transport](https://github.com/esphome/esphome/blob/dev/esphome/components/pn532_i2c/pn532_i2c.cpp)
-- [Arduino WebSockets](https://github.com/Links2004/arduinoWebSockets)
-- [EMVCo specifications](https://www.emvco.com/specifications/) — Books 2 and 3 describe dynamic authentication and the application protocol.
+- [EMV Book 2, Security and Key Management](https://ptacts.uspto.gov/ptacts/public-informations/petitions/1558054/download-documents?artifactId=MrNZBNn78RF-1VEZWu0XN9m1pt23J5Fz8RKgYXm7ZFtD9ydS6NEEF7w) — certificate recovery, static data and DDA formats.
+- [Visa TADG section 5.2.5](https://usa.visa.com/content/dam/VCOM/regional/na/us/partner-with-us/documents/transaction-acceptance-device-guide.pdf) — GPO-based fDDA.
+- [NXP PN532 user manual](https://www.nxp.com/docs/en/user-guide/141520.pdf) — host transport and chaining.
+- [Proxmark EMV PKI implementation](https://github.com/Proxmark/proxmark3/blob/master/client/emv/emv_pki.c) — reference for EMV hash-input ordering. This project's verifier is independently implemented.
+- [RFUID EMV implementation](https://github.com/marksteward/RFUID/blob/master/emv.py) — experimental TTQ capture parameters.
 
-### Interrupted inspection diagnostics
+## HTTPS and clipboard debug export
 
-An interrupted record read now reports `READ RECORD SFI=<n> record=<n>` with the failure reason. Expand APDU results for `transportPhase`, `i2cReadRequested`, `i2cReadReceived`, and `pn532Status` when available. Partial public fields remain visible; signing is skipped after incomplete inspection.
+Open **https://192.168.4.1:433**. Port **433** is intentional. Every request on port 80 redirects with HTTP 308 to that HTTPS origin, preserving its path/query. The application and API are served over TLS; scan updates use **wss://192.168.4.1:433/ws**. Port 81 is no longer used. Responses disable browser caching.
 
-A reported read failure after earlier `9000` results indicates a host-side read/transport failure, not an APDU rejection. Readiness polling tolerates short address-NACK windows documented by NXP. A failed full response read gets one saved-frame retransmission attempt. Remaining failures are reported rather than restarting the whole payment-card sequence. The Arduino I2C layer can still print a low-level error for an attempt that the driver subsequently recovers.
+The ESP32 generates its own RSA-2048 / SHA-256 self-signed certificate on first startup and saves that certificate and private key in the separate `nfctls` NVS namespace. Generation can take several seconds. The certificate includes the access-point IP as a Subject Alternative Name and remains stable across reboots. Browsers display a self-signed certificate warning until an exception/trust decision is made. Certificate initialization failure is reported on serial; port 80 returns 503 if HTTPS could not start. Existing card enrollments use their separate `nfcpki` namespace.
 
-The driver also handles the PN532 status MI bit as a continuation indication rather than an error, collecting the remaining response with an empty InDataExchange request. PN532 RF errors retain their numeric status and a decoded explanation. These recovery paths are host-tested; the exact cause of an intermittent physical I2C failure still requires the new diagnostics and hardware verification.
+**Copy full scan data** in a card's Details copies its complete retained scan JSON. **Copy all scan data** copies every scan retained in the tab. The export includes all retained primitive fields, APDU status/errors, signing data, recovered public keys, verification flags, and device build/reader metadata. It includes full PANs. Existing scan capture bounds/truncation indicators apply; clipboard export does not capture additional card data.
 
-### Fixed: requested 270 bytes, received 14
+Clipboard handling first uses `navigator.clipboard.writeText`, then a browser copy fallback. If browser permissions or certificate treatment block both, a selected read-only JSON text area appears for manual copying. No external service or browser storage is used.
 
-Arduino-ESP32 2.x has legacy two-argument `Wire.requestFrom` overloads returning `uint8_t`. The driver selected one of these: the actual read could succeed with all 270 bytes buffered, while the return count wrapped to 14 (`270 % 256`). The driver then incorrectly rejected and discarded the successful read.
+Hardware checks after flashing:
 
-The driver now explicitly calls `requestFrom(uint16_t address, size_t length, bool stop)`, which returns `size_t`. The host Wire stub mirrors the real overloads, and regression tests reproduce the old 270-to-14 behavior and validate reads across the 255/256 boundary and the exact 270-byte frame. Retry logic alone cannot correct an 8-bit return-value truncation.
+```sh
+curl -I http://192.168.4.1/
+# Expect 308 and Location: https://192.168.4.1:433/
+curl -k https://192.168.4.1:433/api/pki
+```
 
-### Contactless signing results
+Then load the dashboard, confirm live WSS updates on a tap, copy one/all scans and paste the JSON into an editor. Reboot and confirm the TLS certificate identity remains the same. Large WSS updates are base64-chunked below TLS record limits and reassembled before rendering; HTTP bodies are streamed in bounded writes. Host tests cover full-object export, UTF-8 chunk reassembly, and clipboard success/denial/fallback behavior; the TLS handshake and clipboard behavior on your actual browser still require hardware testing.
 
-The AIP DDA bit does not guarantee that a contactless application accepts standalone INTERNAL AUTHENTICATE. Visa fDDA generates its signature during GPO, as described in [Visa TADG section 5.2.5](https://usa.visa.com/content/dam/VCOM/regional/na/us/partner-with-us/documents/transaction-acceptance-device-guide.pdf). The Visa capture profile described below requests fDDA, but full scheme-specific kernel processing and verification are not implemented. If inspection already returns signed dynamic data, the UI reports that result and source without issuing an extra DDA request.
+TLS uses pinned `esp32_https_server` / compatibility wrapper 1.0.0 with the project's pinned Arduino-ESP32 2.0.17 framework. The project provides the legacy `hwcrypto/sha.h` include path through the framework's ESP32-S3 `sha/sha_dma.h` API. JSON request bodies are cached per handler because the compatibility wrapper otherwise consumes them on first read.
 
-When standalone signing is attempted, its response is shown directly in the row and retained in `signingResponse`. Rejections show the status word and explanation, while transport failures show the transport detail. No standalone DDA advertised does not mean the card has no authentication capability; other modes may require a different protocol.
+## Visa RID A000000003 / index 09 capture validation
 
-### Visa `6A81` and the fDDA capture profile
+`config/capk-visa-09.json` contains the public reference key for this RID/index, taken from Proxmark3's public CAPK list. Its 248-byte modulus and exponent `03` have the listed EMV SHA-1 checksum `1FF80A40173F52D7D27E0F26A146A1C8CCB29046`. That list gives an expiry of **2022-12-31**; current official scheme validity/provenance has not been established. This reference is for the key-continuity experiment, with `chainTrusted=false`; it is not a claim of current bank trust. The firmware does not automatically install it. Paste its JSON into the CAPK form and press Save CAPK, then retap and explicitly enroll after signature verification succeeds.
 
-`6A81` on INTERNAL AUTHENTICATE means the requested function is unsupported. Visa contactless fDDA generates its signature as part of GPO, so the firmware now selects that capture path for the Visa RID `A000000003`. It no longer sends standalone INTERNAL AUTHENTICATE to Visa applications.
+A supplied real Visa capture was checked independently with Python integer RSA/SHA-1 operations and with the actual C++ verification core on the host: issuer certificate hash, ICC certificate hash and online fDDA signature all verified; changing the challenge rejected the captured signature. This is validation of that captured proof, not a claim that a new physical retap has already been tested. The capture and PAN are not included in tracked test fixtures.
 
-When the card requests four-byte TTQ (`9F66`) in its PDOL, the experimental Visa capture profile supplies `27800000`: the existing qVSDC flags plus ODA-for-online and online-cryptogram-required. GPO also supplies a fresh unpredictable number, zero amount and configured currency where requested by the PDOL. The sent PDOL values are exposed as `terminalData`; `fddaRequested`, `terminalTtq` and `signingMethod` explain the chosen path. The returned `9F4B` and its source command are displayed without cryptographic verification. No signature returned is reported explicitly, rather than inferred as a successful authentication.
+The capture exposed two verifier assumptions now corrected against Kernel 3: Card Authentication Related Data (`9F69`) can be **5–16 bytes**, including the common seven-byte form; and online fDDA with CID=ARQC requires signed-data format **95**, whereas offline TC/classic DDA use **05**. The expected format is selected from the protocol context, not accepted interchangeably. The full related-data bytes remain in the signature hash, and any returned CTQ is checked against the signed CTQ when present.
 
-This profile deliberately prompts signature generation for a protocol capture experiment. It does not implement the capabilities of a compliant fDDA verifier. GPO can generate local payment cryptograms and update counters; nothing is sent to an issuer, processor or network. Full EMV certificate recovery, trust-chain checks and signature validation remain unimplemented.
-
-References: [Visa TADG section 5.2.5](https://usa.visa.com/content/dam/VCOM/regional/na/us/partner-with-us/documents/transaction-acceptance-device-guide.pdf) describes GPO-based fDDA; [RFUID's EMV implementation](https://github.com/marksteward/RFUID/blob/master/emv.py) documents the TTQ flag layout used for this experimental capture profile.
+Synthetic public-only regression vectors cover seven-byte related data, online format 95, wrong-format rejection, invalid CID/short related data, and changed challenge/transaction data. The on-device RSA self-test includes these cases.

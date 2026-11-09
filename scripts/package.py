@@ -34,4 +34,6 @@ subprocess.run(args, check=True)
 (out / 'flash-layout.json').write_text(json.dumps({hex(o): n for o, n in parts}, indent=2))
 shutil.copy2(base / 'firmware.elf', out / 'firmware.elf')
 shutil.copy2('README.md', out / 'README.md')
+for capk in Path('config').glob('capk-*.json'):
+    shutil.copy2(capk, out / capk.name)
 (out / 'SHA256SUMS').write_text(''.join(f'{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.name}\n' for p in sorted(out.iterdir()) if p.name != 'SHA256SUMS'))

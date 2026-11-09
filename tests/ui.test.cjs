@@ -15,3 +15,25 @@ test('nonpayment tags use UID fallback and list memory is bounded',()=>{
  for(let i=0;i<40;i++)upsertCard(cards,{uid:String(i),scanId:i});assert.equal(cards.size,32);assert(!cards.has('uid:0'));
  cards.clear();assert.equal(cards.size,0);
 });
+const {debugExport,copyDebugText}=require('../web/app.js');
+test('debug export preserves full scan, unknown fields, errors, signatures and public key',()=>{
+ const scan={pan:'4111111111111111',fields:[{tag:'9F46',hex:'ABCD'}],steps:[{command:'READ RECORD',detail:'example failure'}],publicKey:{modulus:'1234',exponent:'03'},requestedSignature:'CDEF',signatureVerified:false,unknownFutureField:{present:true}};
+ const output=JSON.parse(debugExport([scan],{bootId:'test',host:'192.168.4.1:433'}));
+ assert.deepEqual(output.scans,[scan]);assert.equal(output.device.bootId,'test');assert.equal(output.format,'nfc-lab.debug.v1');
+});
+test('clipboard uses native API and does not invoke fallback after success',async()=>{
+ let value;assert.equal(await copyDebugText('full JSON',{writeText:async text=>{value=text;}},()=>{throw Error('unexpected fallback');}),'clipboard');assert.equal(value,'full JSON');
+});
+test('clipboard denial and missing secure clipboard API support fallback/manual copy',async()=>{
+ assert.equal(await copyDebugText('data',{writeText:async()=>{throw Error('NotAllowedError');}},text=>text==='data'),'fallback');
+ assert.equal(await copyDebugText('data',undefined,()=>false),'manual');
+});
+const {receiveMessage}=require('../web/app.js');
+test('large secure socket updates reassemble full UTF-8 JSON across frame boundaries',()=>{
+ const original={type:'card',card:{fields:[{text:'é—☃'.repeat(500)}],signatureVerified:true}};
+ const bytes=Buffer.from(JSON.stringify(original)),pending=new Map();let result;
+ const total=Math.ceil(bytes.length/1024);
+ for(let index=0;index<total;index++)result=receiveMessage({type:'chunk',id:1,index,total,data:bytes.subarray(index*1024,(index+1)*1024).toString('base64')},pending);
+ assert.deepEqual(result,original);assert.equal(pending.size,0);
+ assert.throws(()=>receiveMessage({type:'chunk',id:2,index:0,total:1000000,data:''},pending));
+});

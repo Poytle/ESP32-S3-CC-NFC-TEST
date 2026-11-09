@@ -1,23 +1,24 @@
 #include <Arduino.h>
 #include <WiFi.h>
-#include <WebServer.h>
-#include <WebSocketsServer.h>
+#include "secure_web.h"
 #include "emv_data.h"
+#include "emv_pki.h"
 #include <ArduinoJson.h>
 #include <mbedtls/ecdsa.h>
 #include <mbedtls/sha256.h>
 #include "pn532.h"
 #include "tlv.h"
 #include "web_generated.h"
-WebServer server(80); PN532 reader; bool nfcReady=false, scanRequested=false;
+SecureWebServer server(433);ESPWebServer redirectServer(80);bool tlsReady=false; PN532 reader; bool nfcReady=false, scanRequested=false;
 JsonDocument state;
-WebSocketsServer sockets(81);
+SecureSocketHub sockets;
 JsonDocument cards[4];
 uint32_t scanSequence=0, nextPoll=0, nextReaderRetry=0;
 String heldUid, bootId;
 unsigned absentPolls=0, nextSlot=0;
 uint8_t ddolData[64]; size_t ddolSize=0; bool ddolPresent=false;
 size_t fieldBytes=0;
+emvpki::Bytes authRecords;bool authRecordsComplete=true;unsigned authRequiredRecords=0,authCollectedRecords=0;
 void push(const char *type, JsonDocument &data, int client=-1){
  JsonDocument event;event["type"]=type;event["card"].set(data.as<JsonVariant>());
  String text;serializeJson(event,text);
@@ -33,7 +34,7 @@ void publishCard(){
  state["taps"]=taps;state["readerError"]=reader.lastError();
  cards[slot].set(state.as<JsonVariant>());push("card",state);
 }
-void readerStatus(int client=-1){JsonDocument doc;doc["bootId"]=bootId;doc["readerReady"]=nfcReady;doc["readerError"]=reader.lastError();push("reader",doc,client);}
+void readerStatus(int client=-1){JsonDocument doc;doc["firmwareBuild"]=__DATE__ " " __TIME__;doc["httpsPort"]=433;doc["socketPath"]="/ws";doc["bootId"]=bootId;doc["readerReady"]=nfcReady;doc["readerError"]=reader.lastError();push("reader",doc,client);}
 
 mbedtls_ecdsa_context rootKey, issuerKey, cardKey;
 bool cryptoReady=false;
@@ -85,7 +86,7 @@ bool apdu(const char *name,const uint8_t *cmd,size_t n){
  return true;
 }
 void scan(const uint8_t *uid,size_t uidSize){
- state.clear();fieldBytes=0;ddolSize=0;ddolPresent=false;
+ state.clear();authRecords.clear();authRecordsComplete=true;authRequiredRecords=authCollectedRecords=0;fieldBytes=0;ddolSize=0;ddolPresent=false;
  state["fields"].to<JsonArray>();state["scanId"]=++scanSequence;state["seenMs"]=millis();state["signingStatus"]="Pending initial scan";
  state["steps"].to<JsonArray>();state["verification"]="Not authenticated — no EMV trust chain verification performed";
  state["uid"]=hex(uid,uidSize);state["status"]="Card detected";
@@ -122,15 +123,23 @@ void scan(const uint8_t *uid,size_t uidSize){
  else if(findTag(response,responseSize,0x80,t) && t.size>=2){state["aip"]=hex(t.data,2);aflSize=t.size-2;if(aflSize>sizeof(afl))return;memcpy(afl,t.data+2,aflSize);}
  if(aflSize%4){state["status"]="Malformed AFL";return;}
  unsigned records=0;
- for(size_t i=0;i<aflSize;i+=4){uint8_t sfi=afl[i]>>3,first=afl[i+1],last=afl[i+2];if(sfi<1 || sfi>30 || !first || first>last || last>32)continue;
+ for(size_t i=0;i<aflSize;i+=4){uint8_t sfi=afl[i]>>3,first=afl[i+1],last=afl[i+2],offline=afl[i+3];if(sfi<1 || sfi>30 || !first || first>last || last>32 || offline>last-first+1){authRecordsComplete=false;continue;}
+  authRequiredRecords+=offline;
   for(unsigned rec=first;rec<=last && records<32;rec++,records++){
    uint8_t cmd[]={0,0xb2,uint8_t(rec),uint8_t((sfi<<3)|4),0};
    String name=String("READ RECORD SFI=")+sfi+" record="+rec;
-   if(!apdu(name.c_str(),cmd,5) && apduTransportFailed){
-    state["status"]=String("Inspection interrupted at ")+name+": "+state["failure"]["detail"].as<String>();return;
+   bool read=apdu(name.c_str(),cmd,5);
+   if(rec-first<offline){
+    Tlv record;size_t p=0;
+    if(!read || !nextTlv(response,responseSize,p,record) || record.tag!=0x70 || p!=responseSize)authRecordsComplete=false;
+    else{const uint8_t *data=sfi<=10?record.data:response;size_t size=sfi<=10?record.size:responseSize;
+     if(authRecords.size()+size>8192)authRecordsComplete=false;else{authRecords.insert(authRecords.end(),data,data+size);authCollectedRecords++;}
+    }
    }
+   if(!read && apduTransportFailed){state["status"]=String("Inspection interrupted at ")+name+": "+state["failure"]["detail"].as<String>();return;}
   }
  }
+ if(authCollectedRecords!=authRequiredRecords)authRecordsComplete=false;
  state["status"]="Inspection complete";
 }
 void requestCardSignature(){
@@ -188,9 +197,10 @@ void requestCardSignature(){
   state["signingStatus"]="Card returned signed dynamic data — NOT cryptographically verified";
  }else state["signingStatus"]="Command succeeded but no signed dynamic data returned";
 }
+#include "pki_workflow.h"
 void tapScan(const uint8_t *uid,size_t size){
  scan(uid,size);publishCard();sockets.loop();
- requestCardSignature();publishCard();
+ requestCardSignature();verifyCardProof();publishCard();
 }
 void digest(const uint8_t *b,size_t n,uint8_t *out){mbedtls_sha256_ret(b,n,out,0);}
 size_t publicBytes(mbedtls_ecdsa_context &key,uint8_t *out){size_t n=0;mbedtls_ecp_point_write_binary(&key.grp,&key.Q,MBEDTLS_ECP_PF_UNCOMPRESSED,&n,out,100);return n;}
@@ -216,20 +226,29 @@ void setup(){
  mbedtls_ecdsa_init(&rootKey);mbedtls_ecdsa_init(&issuerKey);mbedtls_ecdsa_init(&cardKey);
  cryptoReady=mbedtls_ecdsa_genkey(&rootKey,MBEDTLS_ECP_DP_SECP256R1,rng,nullptr)==0 && mbedtls_ecdsa_genkey(&issuerKey,MBEDTLS_ECP_DP_SECP256R1,rng,nullptr)==0 && mbedtls_ecdsa_genkey(&cardKey,MBEDTLS_ECP_DP_SECP256R1,rng,nullptr)==0;
  WiFi.mode(WIFI_AP);WiFi.softAP("ESP32-NFC-Lab",nullptr,1,0,2);
- Serial.printf("\nNFC Lab WiFi: ESP32-NFC-Lab (open, no password)\nOpen http://192.168.4.1\nPN532: %s\n",nfcReady?"ready":"not detected");
+ Serial.printf("\nNFC Lab WiFi: ESP32-NFC-Lab (open, no password)\nOpen https://192.168.4.1:433\nPN532: %s\n",nfcReady?"ready":"not detected");
  state["status"]="Ready — tap and hold a card";
  server.on("/",HTTP_GET,[]{server.send_P(200,"text/html",WEB_PAGE);});
  server.on("/api/state",HTTP_GET,[]{state["readerReady"]=nfcReady;state["readerError"]=reader.lastError();sendJson(state);});
  server.on("/api/scan",HTTP_POST,[]{if(!nfcReady){nfcReady=reader.begin();readerStatus();}if(!nfcReady){server.send(503,"text/plain","PN532 not detected");return;}scanRequested=true;server.send(202,"text/plain","Scanning");});
  server.on("/api/clear",HTTP_POST,[]{state.clear();for(auto &card:cards)card.clear();nextSlot=0;push("clear",state);server.send(200,"text/plain","Cleared");});
- server.on("/api/demo",HTTP_POST,demo);server.begin();
- sockets.begin();sockets.onEvent([](uint8_t client,WStype_t type,uint8_t *,size_t){
-  if(type==WStype_CONNECTED){readerStatus(client);for(auto &card:cards)if(!card.isNull())push("card",card,client);}
+ server.on("/api/demo",HTTP_POST,demo);
+ pkiSetup();
+ sockets.begin(server);sockets.onConnect([](uint8_t client){
+  readerStatus(client);pkiConfig(client);for(auto &card:cards)if(!card.isNull())push("card",card,client);
  });
- sockets.enableHeartbeat(15000,3000,2);
+ tlsReady=localtls::initialize(server);
+ if(tlsReady){server.begin();tlsReady=server.running();}
+ if(!tlsReady)Serial.println("HTTPS initialization failed; application is not exposed over HTTP");
+ redirectServer.onNotFound([](){
+  if(!tlsReady){redirectServer.send(503,"text/plain","HTTPS unavailable; inspect serial log");return;}
+  redirectServer.sendHeader("Location",String("https://192.168.4.1:433")+redirectServer.uri());
+  redirectServer.sendHeader("Cache-Control","no-store");redirectServer.send(308,"text/plain","Use HTTPS on port 433");
+ });
+ redirectServer.begin();
 }
 void loop(){
- server.handleClient();sockets.loop();
+ redirectServer.handleClient();if(tlsReady)server.handleClient();sockets.loop();
  if(!nfcReady){
   if(int32_t(millis()-nextReaderRetry)>=0){nextReaderRetry=millis()+5000;nfcReady=reader.begin();readerStatus();}
  }else if(scanRequested || int32_t(millis()-nextPoll)>=0){
